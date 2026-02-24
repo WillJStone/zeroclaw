@@ -40,6 +40,74 @@ impl SlackChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
+    /// Resolve a Slack user ID to a display name via `users.info`.
+    /// Returns the user ID itself on failure (graceful fallback).
+    async fn resolve_user_name(
+        &self,
+        user_id: &str,
+        cache: &mut HashMap<String, String>,
+    ) -> String {
+        if let Some(name) = cache.get(user_id) {
+            return name.clone();
+        }
+
+        let name = match self
+            .http_client()
+            .get("https://slack.com/api/users.info")
+            .bearer_auth(&self.bot_token)
+            .query(&[("user", user_id)])
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    if data.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                        data.get("user")
+                            .and_then(|u| {
+                                u.get("profile")
+                                    .and_then(|p| {
+                                        p.get("display_name")
+                                            .and_then(|n| n.as_str())
+                                            .filter(|n| !n.is_empty())
+                                            .or_else(|| {
+                                                p.get("real_name")
+                                                    .and_then(|n| n.as_str())
+                                                    .filter(|n| !n.is_empty())
+                                            })
+                                    })
+                                    .or_else(|| u.get("name").and_then(|n| n.as_str()))
+                            })
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    "Slack users.info for {user_id}: ok but no name fields found"
+                                );
+                                user_id.to_string()
+                            })
+                    } else {
+                        let err = data
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("unknown");
+                        tracing::warn!("Slack users.info failed for {user_id}: {err}");
+                        user_id.to_string()
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Slack users.info parse error for {user_id}: {e}");
+                    user_id.to_string()
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Slack users.info request error for {user_id}: {e}");
+                user_id.to_string()
+            }
+        };
+
+        cache.insert(user_id.to_string(), name.clone());
+        name
+    }
+
     /// Get the bot's own user ID so we can ignore our own messages
     async fn get_bot_user_id(&self) -> Option<String> {
         let resp: serde_json::Value = self
@@ -263,10 +331,13 @@ impl SlackChannel {
 
         tracing::info!("Slack: Socket Mode connected (selective-response: @-mention only)");
 
-        // Thread context buffer: (channel_id, thread_ts) -> Vec<(sender, text)>
+        // Thread context buffer: (channel_id, thread_ts) -> Vec<(display_name, text)>
         // Capped at 20 messages per thread.
         let mut thread_context: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
         const MAX_THREAD_CONTEXT: usize = 20;
+
+        // User ID -> display name cache (persists for the WebSocket connection lifetime)
+        let mut user_names: HashMap<String, String> = HashMap::new();
 
         loop {
             let msg = match read.next().await {
@@ -363,9 +434,10 @@ impl SlackChannel {
             let is_threaded = event.get("thread_ts").is_some();
             let thread_key = (event_channel.to_string(), thread_ts.to_string());
 
-            // Buffer this message in thread context
+            // Buffer this message in thread context (with resolved display name)
+            let display_name = self.resolve_user_name(user, &mut user_names).await;
             let buffer = thread_context.entry(thread_key.clone()).or_default();
-            buffer.push((user.to_string(), text.to_string()));
+            buffer.push((display_name, text.to_string()));
             if buffer.len() > MAX_THREAD_CONTEXT {
                 buffer.remove(0);
             }
@@ -401,9 +473,15 @@ impl SlackChannel {
                 format!("{context_prefix}[Message directed at bot]\n{stripped}")
             };
 
+            // Re-fetch the display name from cache (already resolved during buffering)
+            let sender_name = user_names
+                .get(user)
+                .cloned()
+                .unwrap_or_else(|| user.to_string());
+
             let channel_msg = ChannelMessage {
                 id: format!("slack_{event_channel}_{ts}"),
-                sender: user.to_string(),
+                sender: sender_name,
                 reply_target: event_channel.to_string(),
                 content,
                 channel: "slack".to_string(),
