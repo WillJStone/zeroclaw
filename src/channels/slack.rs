@@ -1,7 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Slack channel — polls conversations.history via Web API
 pub struct SlackChannel {
@@ -212,7 +212,15 @@ impl Channel for SlackChannel {
         let scoped_channel = self.configured_channel_id();
         let mut discovered_channels: Vec<String> = Vec::new();
         let mut last_discovery = Instant::now();
+        // Seed with current timestamp so we only process messages arriving after startup
+        let startup_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| format!("{}.000000", d.as_secs()))
+            .unwrap_or_default();
         let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
+        let startup_ts_seed = startup_ts;
+        // Track active threads: (channel_id, thread_ts) -> last seen reply ts
+        let mut active_threads: HashMap<(String, String), String> = HashMap::new();
 
         if let Some(ref channel_id) = scoped_channel {
             tracing::info!("Slack channel listening on #{channel_id}...");
@@ -258,10 +266,12 @@ impl Channel for SlackChannel {
 
             for channel_id in target_channels {
                 let mut params = vec![("channel", channel_id.clone()), ("limit", "10".to_string())];
-                if let Some(last_ts) = last_ts_by_channel.get(&channel_id).cloned() {
-                    if !last_ts.is_empty() {
-                        params.push(("oldest", last_ts));
-                    }
+                let effective_ts = last_ts_by_channel
+                    .get(&channel_id)
+                    .cloned()
+                    .unwrap_or_else(|| startup_ts_seed.clone());
+                if !effective_ts.is_empty() {
+                    params.push(("oldest", effective_ts));
                 }
 
                 let resp = match self
@@ -330,6 +340,15 @@ impl Channel for SlackChannel {
 
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
 
+                        let thread_ts_val = Self::inbound_thread_ts(msg, ts);
+
+                        // Track this thread so we poll replies on subsequent loops
+                        if let Some(ref tts) = thread_ts_val {
+                            active_threads
+                                .entry((channel_id.clone(), tts.clone()))
+                                .or_insert_with(|| ts.to_string());
+                        }
+
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
                             sender: user.to_string(),
@@ -340,11 +359,100 @@ impl Channel for SlackChannel {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
-                            thread_ts: Self::inbound_thread_ts(msg, ts),
+                            thread_ts: thread_ts_val,
                         };
 
                         if tx.send(channel_msg).await.is_err() {
                             return Ok(());
+                        }
+                    }
+                }
+
+                // Poll active threads in this channel for new replies
+                let thread_keys: Vec<(String, String)> = active_threads
+                    .keys()
+                    .filter(|(cid, _)| cid == &channel_id)
+                    .cloned()
+                    .collect();
+                for (cid, thread_ts) in thread_keys {
+                    let last_reply_ts = active_threads
+                        .get(&(cid.clone(), thread_ts.clone()))
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let reply_params = vec![
+                        ("channel", cid.clone()),
+                        ("ts", thread_ts.clone()),
+                        ("oldest", last_reply_ts.clone()),
+                        ("limit", "10".to_string()),
+                    ];
+
+                    let resp = match self
+                        .http_client()
+                        .get("https://slack.com/api/conversations.replies")
+                        .bearer_auth(&self.bot_token)
+                        .query(&reply_params)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("Slack thread poll error for {cid}/{thread_ts}: {e}");
+                            continue;
+                        }
+                    };
+
+                    let data: serde_json::Value = match resp.json().await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!("Slack thread parse error for {cid}/{thread_ts}: {e}");
+                            continue;
+                        }
+                    };
+
+                    if data.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                        continue;
+                    }
+
+                    if let Some(replies) = data.get("messages").and_then(|m| m.as_array()) {
+                        for msg in replies {
+                            let rts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+                            let user = msg
+                                .get("user")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("unknown");
+                            let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+
+                            // Skip bot's own, empty, or already-seen
+                            if user == bot_user_id || text.is_empty() || rts <= last_reply_ts.as_str() {
+                                continue;
+                            }
+
+                            if !self.is_user_allowed(user) {
+                                continue;
+                            }
+
+                            active_threads.insert(
+                                (cid.clone(), thread_ts.clone()),
+                                rts.to_string(),
+                            );
+
+                            let channel_msg = ChannelMessage {
+                                id: format!("slack_{cid}_{rts}"),
+                                sender: user.to_string(),
+                                reply_target: cid.clone(),
+                                content: text.to_string(),
+                                channel: "slack".to_string(),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                thread_ts: Some(thread_ts.clone()),
+                            };
+
+                            if tx.send(channel_msg).await.is_err() {
+                                return Ok(());
+                            }
                         }
                     }
                 }

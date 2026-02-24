@@ -223,7 +223,8 @@ impl ComposioTool {
         entity_id: Option<&str>,
         connected_account_ref: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
-        let tool_slug = normalize_tool_slug(action_name);
+        // v3 expects the original slug as-is (e.g. GOOGLECALENDAR_FIND_EVENT)
+        let tool_slug = action_name.trim().to_string();
         let app_hint = app_name_hint
             .map(normalize_app_slug)
             .filter(|app| !app.is_empty())
@@ -260,7 +261,13 @@ impl ComposioTool {
                 let mut v2_errors = Vec::new();
                 for candidate in v2_candidates {
                     match self
-                        .execute_action_v2(&candidate, params.clone(), entity_id)
+                        .execute_action_v2(
+                            &candidate,
+                            params.clone(),
+                            entity_id,
+                            resolved_account_ref.as_deref(),
+                            app_hint.as_deref(),
+                        )
                         .await
                     {
                         Ok(result) => return Ok(result),
@@ -366,6 +373,8 @@ impl ComposioTool {
         action_name: &str,
         params: serde_json::Value,
         entity_id: Option<&str>,
+        connected_account_id: Option<&str>,
+        app_name: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let url = format!("{COMPOSIO_API_BASE_V2}/actions/{action_name}/execute");
 
@@ -375,6 +384,12 @@ impl ComposioTool {
 
         if let Some(entity) = entity_id {
             body["entityId"] = json!(entity);
+        }
+        if let Some(account_id) = connected_account_id {
+            body["connectedAccountId"] = json!(account_id);
+        }
+        if let Some(app) = app_name {
+            body["appName"] = json!(app);
         }
 
         let resp = self
