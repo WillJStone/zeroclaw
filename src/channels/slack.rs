@@ -1,19 +1,29 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// Slack channel — polls conversations.history via Web API
+/// Slack channel — supports Socket Mode (real-time WebSocket) when `app_token`
+/// is configured, otherwise falls back to polling via conversations.history.
 pub struct SlackChannel {
     bot_token: String,
+    app_token: Option<String>,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
 }
 
 impl SlackChannel {
-    pub fn new(bot_token: String, channel_id: Option<String>, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        bot_token: String,
+        app_token: Option<String>,
+        channel_id: Option<String>,
+        allowed_users: Vec<String>,
+    ) -> Self {
         Self {
             bot_token,
+            app_token,
             channel_id,
             allowed_users,
         }
@@ -28,6 +38,74 @@ impl SlackChannel {
     /// `"*"` means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+    }
+
+    /// Resolve a Slack user ID to a display name via `users.info`.
+    /// Returns the user ID itself on failure (graceful fallback).
+    async fn resolve_user_name(
+        &self,
+        user_id: &str,
+        cache: &mut HashMap<String, String>,
+    ) -> String {
+        if let Some(name) = cache.get(user_id) {
+            return name.clone();
+        }
+
+        let name = match self
+            .http_client()
+            .get("https://slack.com/api/users.info")
+            .bearer_auth(&self.bot_token)
+            .query(&[("user", user_id)])
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(data) => {
+                    if data.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                        data.get("user")
+                            .and_then(|u| {
+                                u.get("profile")
+                                    .and_then(|p| {
+                                        p.get("display_name")
+                                            .and_then(|n| n.as_str())
+                                            .filter(|n| !n.is_empty())
+                                            .or_else(|| {
+                                                p.get("real_name")
+                                                    .and_then(|n| n.as_str())
+                                                    .filter(|n| !n.is_empty())
+                                            })
+                                    })
+                                    .or_else(|| u.get("name").and_then(|n| n.as_str()))
+                            })
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    "Slack users.info for {user_id}: ok but no name fields found"
+                                );
+                                user_id.to_string()
+                            })
+                    } else {
+                        let err = data
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("unknown");
+                        tracing::warn!("Slack users.info failed for {user_id}: {err}");
+                        user_id.to_string()
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Slack users.info parse error for {user_id}: {e}");
+                    user_id.to_string()
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Slack users.info request error for {user_id}: {e}");
+                user_id.to_string()
+            }
+        };
+
+        cache.insert(user_id.to_string(), name.clone());
+        name
     }
 
     /// Get the bot's own user ID so we can ignore our own messages
@@ -176,56 +254,257 @@ impl SlackChannel {
             .or_insert_with(|| now_ts.to_string())
             .clone()
     }
-}
 
-#[async_trait]
-impl Channel for SlackChannel {
-    fn name(&self) -> &str {
-        "slack"
-    }
+    // ── Socket Mode helpers ──────────────────────────────────────
 
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let mut body = serde_json::json!({
-            "channel": message.recipient,
-            "text": message.content
-        });
-
-        if let Some(ref ts) = message.thread_ts {
-            body["thread_ts"] = serde_json::json!(ts);
-        }
-
-        let resp = self
+    /// Request a WebSocket URL from Slack's apps.connections.open endpoint.
+    async fn open_socket_mode_connection(&self, app_token: &str) -> anyhow::Result<String> {
+        let resp: serde_json::Value = self
             .http_client()
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(&self.bot_token)
-            .json(&body)
+            .post("https://slack.com/api/apps.connections.open")
+            .bearer_auth(app_token)
             .send()
+            .await?
+            .json()
             .await?;
 
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-
-        if !status.is_success() {
-            anyhow::bail!("Slack chat.postMessage failed ({status}): {body}");
-        }
-
-        // Slack returns 200 for most app-level errors; check JSON "ok" field
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            let err = parsed
+        if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = resp
                 .get("error")
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
-            anyhow::bail!("Slack chat.postMessage failed: {err}");
+            anyhow::bail!("Slack apps.connections.open failed: {err}");
+        }
+
+        resp.get("url")
+            .and_then(|u| u.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open: missing url in response"))
+    }
+
+    /// Check whether `text` contains an @-mention for the given bot user ID.
+    /// Slack encodes mentions as `<@U12345>`.
+    fn contains_bot_mention(text: &str, bot_user_id: &str) -> bool {
+        if bot_user_id.is_empty() {
+            return false;
+        }
+        let tag = format!("<@{bot_user_id}>");
+        text.contains(&tag)
+    }
+
+    /// Remove all `<@bot_user_id>` mention tags from text and trim whitespace.
+    fn strip_bot_mention(text: &str, bot_user_id: &str) -> String {
+        if bot_user_id.is_empty() {
+            return text.to_string();
+        }
+        let tag = format!("<@{bot_user_id}>");
+        text.replace(&tag, "").trim().to_string()
+    }
+
+    /// Format buffered thread messages as context to prepend to a mentioned message.
+    fn format_thread_context(messages: &[(String, String)]) -> String {
+        if messages.is_empty() {
+            return String::new();
+        }
+        let mut ctx = String::from("[Thread context — recent messages in this thread]\n");
+        for (sender, text) in messages {
+            ctx.push_str(&format!("{sender}: {text}\n"));
+        }
+        ctx.push('\n');
+        ctx
+    }
+
+    /// Socket Mode listener — connects via WebSocket, receives events in real-time,
+    /// and only sends messages through `tx` when the bot is @-mentioned.
+    async fn listen_socket_mode(
+        &self,
+        app_token: &str,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
+        let scoped_channel = self.configured_channel_id();
+
+        tracing::info!("Slack: connecting via Socket Mode...");
+        let ws_url = self.open_socket_mode_connection(app_token).await?;
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        tracing::info!("Slack: Socket Mode connected (selective-response: @-mention only)");
+
+        // Thread context buffer: (channel_id, thread_ts) -> Vec<(display_name, text)>
+        // Capped at 20 messages per thread.
+        let mut thread_context: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+        const MAX_THREAD_CONTEXT: usize = 20;
+
+        // User ID -> display name cache (persists for the WebSocket connection lifetime)
+        let mut user_names: HashMap<String, String> = HashMap::new();
+
+        loop {
+            let msg = match read.next().await {
+                Some(Ok(WsMessage::Text(t))) => t,
+                Some(Ok(WsMessage::Close(_))) | None => {
+                    tracing::warn!("Slack: Socket Mode connection closed");
+                    break;
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("Slack: Socket Mode WebSocket error: {e}");
+                    break;
+                }
+                _ => continue,
+            };
+
+            let envelope: serde_json::Value = match serde_json::from_str(msg.as_ref()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // ACK every envelope immediately (Slack requires this within ~5 seconds)
+            if let Some(envelope_id) = envelope.get("envelope_id").and_then(|e| e.as_str()) {
+                let ack = serde_json::json!({"envelope_id": envelope_id});
+                if write
+                    .send(WsMessage::Text(ack.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            let envelope_type = envelope.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            match envelope_type {
+                "disconnect" => {
+                    tracing::info!("Slack: received disconnect, will reconnect");
+                    break;
+                }
+                "events_api" => {}
+                _ => continue,
+            }
+
+            // Extract the inner event from the events_api envelope
+            let event = match envelope.get("payload").and_then(|p| p.get("event")) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // Only handle plain messages (no subtypes like edits, deletions, bot_message)
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if event_type != "message" {
+                continue;
+            }
+            if event.get("subtype").is_some() {
+                continue;
+            }
+
+            let user = match event.get("user").and_then(|u| u.as_str()) {
+                Some(u) => u,
+                None => continue,
+            };
+            let text = event.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let ts = event.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+            let event_channel = event.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+
+            // Skip bot's own messages
+            if user == bot_user_id {
+                continue;
+            }
+
+            // Skip unauthorized users
+            if !self.is_user_allowed(user) {
+                continue;
+            }
+
+            // Apply channel filter
+            if let Some(ref target) = scoped_channel {
+                if event_channel != target.as_str() {
+                    continue;
+                }
+            }
+
+            // Skip empty messages
+            if text.is_empty() || ts.is_empty() {
+                continue;
+            }
+
+            // Determine thread identity
+            let thread_ts = event
+                .get("thread_ts")
+                .and_then(|t| t.as_str())
+                .unwrap_or(ts);
+            let is_threaded = event.get("thread_ts").is_some();
+            let thread_key = (event_channel.to_string(), thread_ts.to_string());
+
+            // Buffer this message in thread context (with resolved display name)
+            let display_name = self.resolve_user_name(user, &mut user_names).await;
+            let buffer = thread_context.entry(thread_key.clone()).or_default();
+            buffer.push((display_name, text.to_string()));
+            if buffer.len() > MAX_THREAD_CONTEXT {
+                buffer.remove(0);
+            }
+
+            // Selective response: only respond when @-mentioned
+            let mentioned = Self::contains_bot_mention(text, &bot_user_id);
+            if !mentioned {
+                tracing::debug!(
+                    "Slack: buffered non-mentioned message in {}/{}",
+                    event_channel,
+                    thread_ts
+                );
+                continue;
+            }
+
+            // Build content: thread context + stripped message
+            let stripped = Self::strip_bot_mention(text, &bot_user_id);
+            let context_prefix = if is_threaded {
+                // Exclude the current message itself from context
+                let ctx_msgs = &thread_context[&thread_key];
+                let prior = if ctx_msgs.len() > 1 {
+                    &ctx_msgs[..ctx_msgs.len() - 1]
+                } else {
+                    &[]
+                };
+                Self::format_thread_context(prior)
+            } else {
+                String::new()
+            };
+            let content = if context_prefix.is_empty() {
+                stripped
+            } else {
+                format!("{context_prefix}[Message directed at bot]\n{stripped}")
+            };
+
+            // Re-fetch the display name from cache (already resolved during buffering)
+            let sender_name = user_names
+                .get(user)
+                .cloned()
+                .unwrap_or_else(|| user.to_string());
+
+            let channel_msg = ChannelMessage {
+                id: format!("slack_{event_channel}_{ts}"),
+                sender: sender_name,
+                reply_target: event_channel.to_string(),
+                content,
+                channel: "slack".to_string(),
+                timestamp: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                thread_ts: Some(thread_ts.to_string()),
+            };
+
+            if tx.send(channel_msg).await.is_err() {
+                return Ok(());
+            }
         }
 
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    /// Polling-based listener — original implementation used when `app_token` is not configured.
+    async fn listen_polling(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
         let bot_user_id = self.get_bot_user_id().await.unwrap_or_default();
         let scoped_channel = self.configured_channel_id();
         let mut discovered_channels: Vec<String> = Vec::new();
@@ -235,10 +514,10 @@ impl Channel for SlackChannel {
         let mut active_threads: HashMap<(String, String), String> = HashMap::new();
 
         if let Some(ref channel_id) = scoped_channel {
-            tracing::info!("Slack channel listening on #{channel_id}...");
+            tracing::info!("Slack channel listening (polling) on #{channel_id}...");
         } else {
             tracing::info!(
-                "Slack channel_id not set (or '*'); listening across all accessible channels."
+                "Slack channel_id not set (or '*'); listening (polling) across all accessible channels."
             );
         }
 
@@ -444,7 +723,10 @@ impl Channel for SlackChannel {
                             let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
 
                             // Skip bot's own, empty, or already-seen
-                            if user == bot_user_id || text.is_empty() || rts <= last_reply_ts.as_str() {
+                            if user == bot_user_id
+                                || text.is_empty()
+                                || rts <= last_reply_ts.as_str()
+                            {
                                 continue;
                             }
 
@@ -452,10 +734,8 @@ impl Channel for SlackChannel {
                                 continue;
                             }
 
-                            active_threads.insert(
-                                (cid.clone(), thread_ts.clone()),
-                                rts.to_string(),
-                            );
+                            active_threads
+                                .insert((cid.clone(), thread_ts.clone()), rts.to_string());
 
                             let channel_msg = ChannelMessage {
                                 id: format!("slack_{cid}_{rts}"),
@@ -479,6 +759,62 @@ impl Channel for SlackChannel {
             }
         }
     }
+}
+
+#[async_trait]
+impl Channel for SlackChannel {
+    fn name(&self) -> &str {
+        "slack"
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({
+            "channel": message.recipient,
+            "text": message.content
+        });
+
+        if let Some(ref ts) = message.thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {body}");
+        }
+
+        // Slack returns 200 for most app-level errors; check JSON "ok" field
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        if let Some(ref app_token) = self.app_token {
+            self.listen_socket_mode(app_token, tx).await
+        } else {
+            self.listen_polling(tx).await
+        }
+    }
 
     async fn health_check(&self) -> bool {
         self.http_client()
@@ -497,13 +833,13 @@ mod tests {
 
     #[test]
     fn slack_channel_name() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![]);
         assert_eq!(ch.name(), "slack");
     }
 
     #[test]
     fn slack_channel_with_channel_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some("C12345".into()), vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, Some("C12345".into()), vec![]);
         assert_eq!(ch.channel_id, Some("C12345".to_string()));
     }
 
@@ -537,20 +873,25 @@ mod tests {
 
     #[test]
     fn empty_allowlist_denies_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec![]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![]);
         assert!(!ch.is_user_allowed("U12345"));
         assert!(!ch.is_user_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["*".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["*".into()]);
         assert!(ch.is_user_allowed("U12345"));
     }
 
     #[test]
     fn specific_allowlist_filters() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "U222".into()]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            None,
+            vec!["U111".into(), "U222".into()],
+        );
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("U222"));
         assert!(!ch.is_user_allowed("U333"));
@@ -558,27 +899,32 @@ mod tests {
 
     #[test]
     fn allowlist_exact_match_not_substring() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
         assert!(!ch.is_user_allowed("U1111"));
         assert!(!ch.is_user_allowed("U11"));
     }
 
     #[test]
     fn allowlist_empty_user_id() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
         assert!(!ch.is_user_allowed(""));
     }
 
     #[test]
     fn allowlist_case_sensitive() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into()]);
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec!["U111".into()]);
         assert!(ch.is_user_allowed("U111"));
         assert!(!ch.is_user_allowed("u111"));
     }
 
     #[test]
     fn allowlist_wildcard_and_specific() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, vec!["U111".into(), "*".into()]);
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            None,
+            vec!["U111".into(), "*".into()],
+        );
         assert!(ch.is_user_allowed("U111"));
         assert!(ch.is_user_allowed("anyone"));
     }
@@ -681,5 +1027,94 @@ mod tests {
             cursors.get("C123").map(String::as_str),
             Some("1700000000.000001")
         );
+    }
+
+    // ── Mention detection tests ──────────────────────────────────
+
+    #[test]
+    fn contains_bot_mention_detects_slack_format() {
+        assert!(SlackChannel::contains_bot_mention(
+            "hey <@U12345> what do you think?",
+            "U12345"
+        ));
+    }
+
+    #[test]
+    fn contains_bot_mention_rejects_partial_match() {
+        assert!(!SlackChannel::contains_bot_mention("U12345", "U12345"));
+        assert!(!SlackChannel::contains_bot_mention("<@U1234>", "U12345"));
+        assert!(!SlackChannel::contains_bot_mention("<@U123456>", "U12345"));
+    }
+
+    #[test]
+    fn contains_bot_mention_empty_bot_id_returns_false() {
+        assert!(!SlackChannel::contains_bot_mention("<@>", ""));
+        assert!(!SlackChannel::contains_bot_mention("hello", ""));
+    }
+
+    #[test]
+    fn contains_bot_mention_no_mention_returns_false() {
+        assert!(!SlackChannel::contains_bot_mention(
+            "just a regular message",
+            "U12345"
+        ));
+    }
+
+    // ── Mention stripping tests ──────────────────────────────────
+
+    #[test]
+    fn strip_bot_mention_removes_tag_and_trims() {
+        assert_eq!(
+            SlackChannel::strip_bot_mention("<@U12345> what do you think?", "U12345"),
+            "what do you think?"
+        );
+    }
+
+    #[test]
+    fn strip_bot_mention_handles_multiple_mentions() {
+        assert_eq!(
+            SlackChannel::strip_bot_mention("<@U12345> hey <@U12345>", "U12345"),
+            "hey"
+        );
+    }
+
+    #[test]
+    fn strip_bot_mention_handles_empty_after_strip() {
+        assert_eq!(SlackChannel::strip_bot_mention("<@U12345>", "U12345"), "");
+    }
+
+    #[test]
+    fn strip_bot_mention_empty_bot_id_returns_original() {
+        assert_eq!(
+            SlackChannel::strip_bot_mention("hello <@U12345>", ""),
+            "hello <@U12345>"
+        );
+    }
+
+    // ── Thread context formatting tests ──────────────────────────
+
+    #[test]
+    fn format_thread_context_empty_returns_empty() {
+        assert_eq!(SlackChannel::format_thread_context(&[]), "");
+    }
+
+    #[test]
+    fn format_thread_context_formats_with_header() {
+        let msgs = vec![
+            ("U111".to_string(), "option A is better".to_string()),
+            ("U222".to_string(), "I disagree".to_string()),
+        ];
+        let ctx = SlackChannel::format_thread_context(&msgs);
+        assert!(ctx.starts_with("[Thread context"));
+        assert!(ctx.contains("U111: option A is better"));
+        assert!(ctx.contains("U222: I disagree"));
+        assert!(ctx.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn format_thread_context_single_message() {
+        let msgs = vec![("U111".to_string(), "hello".to_string())];
+        let ctx = SlackChannel::format_thread_context(&msgs);
+        assert!(ctx.contains("U111: hello"));
     }
 }
