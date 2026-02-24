@@ -38,7 +38,12 @@ You are running in headless mode, invoked by ZeroClaw as a tool. Your output wil
    cargo test 2>&1 | grep "^test result:"
    ```
 
-8. Report:
+8. Push updated local branch to fork:
+   ```
+   git push mine local --force-with-lease
+   ```
+
+9. Report:
    ```
    MERGE COMPLETE
 
