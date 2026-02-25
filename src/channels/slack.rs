@@ -1,7 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -301,6 +301,85 @@ impl SlackChannel {
         text.replace(&tag, "").trim().to_string()
     }
 
+    /// Fetch full thread history via `conversations.replies` and populate the
+    /// thread context buffer. Called once per thread on first @-mention to
+    /// capture messages the bot sent (e.g. cron posts) or messages that arrived
+    /// before the WebSocket connected.
+    async fn backfill_thread_context(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+        bot_user_id: &str,
+        thread_context: &mut HashMap<(String, String), Vec<(String, String)>>,
+        user_names: &mut HashMap<String, String>,
+    ) {
+        let params = vec![("channel", channel_id), ("ts", thread_ts), ("limit", "20")];
+
+        let data: serde_json::Value = match self
+            .http_client()
+            .get("https://slack.com/api/conversations.replies")
+            .bearer_auth(&self.bot_token)
+            .query(&params)
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Slack thread backfill parse error: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Slack thread backfill request error: {e}");
+                return;
+            }
+        };
+
+        if data.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = data
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            tracing::warn!("Slack thread backfill failed: {err}");
+            return;
+        }
+
+        let Some(messages) = data.get("messages").and_then(|m| m.as_array()) else {
+            return;
+        };
+
+        let thread_key = (channel_id.to_string(), thread_ts.to_string());
+        let buffer = thread_context.entry(thread_key).or_default();
+
+        // Replace buffer with full thread history (messages come oldest-first from API)
+        buffer.clear();
+        for msg in messages {
+            let user = msg
+                .get("user")
+                .and_then(|u| u.as_str())
+                .unwrap_or("unknown");
+            let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if text.is_empty() {
+                continue;
+            }
+
+            let name = if user == bot_user_id {
+                "bot".to_string()
+            } else {
+                self.resolve_user_name(user, user_names).await
+            };
+            buffer.push((name, text.to_string()));
+        }
+
+        tracing::debug!(
+            "Slack: backfilled {} messages for thread {}/{}",
+            buffer.len(),
+            channel_id,
+            thread_ts
+        );
+    }
+
     /// Format buffered thread messages as context to prepend to a mentioned message.
     fn format_thread_context(messages: &[(String, String)]) -> String {
         if messages.is_empty() {
@@ -338,6 +417,10 @@ impl SlackChannel {
 
         // User ID -> display name cache (persists for the WebSocket connection lifetime)
         let mut user_names: HashMap<String, String> = HashMap::new();
+
+        // Tracks threads that have been backfilled via conversations.replies.
+        // Once backfilled, subsequent mentions in the same thread use the live buffer.
+        let mut backfilled_threads: HashSet<(String, String)> = HashSet::new();
 
         loop {
             let msg = match read.next().await {
@@ -451,6 +534,30 @@ impl SlackChannel {
                     thread_ts
                 );
                 continue;
+            }
+
+            // Backfill thread history on first mention in a thread.
+            // Captures messages the bot sent (cron posts) and messages from
+            // before the WebSocket connected.
+            if is_threaded && backfilled_threads.insert(thread_key.clone()) {
+                self.backfill_thread_context(
+                    event_channel,
+                    thread_ts,
+                    &bot_user_id,
+                    &mut thread_context,
+                    &mut user_names,
+                )
+                .await;
+                // Re-add the current message since backfill replaced the buffer
+                // and it may not include this just-arrived message.
+                let buffer = thread_context.entry(thread_key.clone()).or_default();
+                let current_name = user_names
+                    .get(user)
+                    .cloned()
+                    .unwrap_or_else(|| user.to_string());
+                if !buffer.iter().any(|(_, t)| t == text) {
+                    buffer.push((current_name, text.to_string()));
+                }
             }
 
             // Build content: thread context + stripped message
@@ -1116,5 +1223,78 @@ mod tests {
         let msgs = vec![("U111".to_string(), "hello".to_string())];
         let ctx = SlackChannel::format_thread_context(&msgs);
         assert!(ctx.contains("U111: hello"));
+    }
+
+    // ── Thread context backfill tests ────────────────────────────
+
+    #[test]
+    fn format_thread_context_includes_bot_messages() {
+        // After backfill, bot messages are labeled "bot" alongside user display names
+        let msgs = vec![
+            ("bot".to_string(), "this thread is for testing".to_string()),
+            ("Alice".to_string(), "got it, thanks".to_string()),
+            (
+                "Bob".to_string(),
+                "<@UBOTID> what do you think?".to_string(),
+            ),
+        ];
+        let ctx = SlackChannel::format_thread_context(&msgs);
+        assert!(ctx.contains("bot: this thread is for testing"));
+        assert!(ctx.contains("Alice: got it, thanks"));
+        assert!(ctx.contains("Bob: <@UBOTID> what do you think?"));
+    }
+
+    #[test]
+    fn format_thread_context_excludes_current_message() {
+        // When building context, the current (mentioned) message is excluded
+        let msgs = vec![
+            ("bot".to_string(), "scheduled report".to_string()),
+            ("Alice".to_string(), "interesting".to_string()),
+            ("Alice".to_string(), "<@UBOTID> explain more".to_string()),
+        ];
+        // Simulate excluding the last message (current mention)
+        let prior = &msgs[..msgs.len() - 1];
+        let ctx = SlackChannel::format_thread_context(prior);
+        assert!(ctx.contains("bot: scheduled report"));
+        assert!(ctx.contains("Alice: interesting"));
+        assert!(!ctx.contains("explain more"));
+    }
+
+    #[test]
+    fn backfill_dedup_does_not_readd_existing_message() {
+        // Simulates the dedup check after backfill: if the current message
+        // text already exists in the buffer, it should not be added again.
+        let mut buffer: Vec<(String, String)> = vec![
+            ("bot".to_string(), "hello from cron".to_string()),
+            ("Alice".to_string(), "<@UBOTID> respond".to_string()),
+        ];
+        let current_text = "<@UBOTID> respond";
+        let current_name = "Alice".to_string();
+
+        // This mirrors the dedup logic in listen_socket_mode
+        if !buffer.iter().any(|(_, t)| t == current_text) {
+            buffer.push((current_name, current_text.to_string()));
+        }
+
+        // Should still be 2, not 3
+        assert_eq!(buffer.len(), 2);
+    }
+
+    #[test]
+    fn backfill_dedup_adds_new_message() {
+        // If the current message is genuinely new (not in backfill), it gets added.
+        let mut buffer: Vec<(String, String)> = vec![
+            ("bot".to_string(), "hello from cron".to_string()),
+            ("Alice".to_string(), "interesting".to_string()),
+        ];
+        let current_text = "<@UBOTID> what about this?";
+        let current_name = "Alice".to_string();
+
+        if !buffer.iter().any(|(_, t)| t == current_text) {
+            buffer.push((current_name, current_text.to_string()));
+        }
+
+        assert_eq!(buffer.len(), 3);
+        assert_eq!(buffer[2].1, "<@UBOTID> what about this?");
     }
 }
