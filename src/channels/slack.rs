@@ -525,8 +525,11 @@ impl SlackChannel {
                 buffer.remove(0);
             }
 
-            // Selective response: only respond when @-mentioned
-            let mentioned = Self::contains_bot_mention(text, &bot_user_id);
+            // DMs (channel_type == "im") don't require an @-mention
+            let is_dm = event.get("channel_type").and_then(|t| t.as_str()) == Some("im");
+
+            // Selective response: respond to @-mentions and all DMs
+            let mentioned = is_dm || Self::contains_bot_mention(text, &bot_user_id);
             if !mentioned {
                 tracing::debug!(
                     "Slack: buffered non-mentioned message in {}/{}",
@@ -560,7 +563,13 @@ impl SlackChannel {
                 }
             }
 
-            // Build content: thread context + stripped message
+            // Re-fetch the display name from cache (already resolved during buffering)
+            let sender_name = user_names
+                .get(user)
+                .cloned()
+                .unwrap_or_else(|| user.to_string());
+
+            // Build content: DM prefix + thread context + stripped message
             let stripped = Self::strip_bot_mention(text, &bot_user_id);
             let context_prefix = if is_threaded {
                 // Exclude the current message itself from context
@@ -579,12 +588,11 @@ impl SlackChannel {
             } else {
                 format!("{context_prefix}[Message directed at bot]\n{stripped}")
             };
-
-            // Re-fetch the display name from cache (already resolved during buffering)
-            let sender_name = user_names
-                .get(user)
-                .cloned()
-                .unwrap_or_else(|| user.to_string());
+            let content = if is_dm {
+                format!("[Direct message from {sender_name}]\n{content}")
+            } else {
+                content
+            };
 
             let channel_msg = ChannelMessage {
                 id: format!("slack_{event_channel}_{ts}"),
@@ -1296,5 +1304,95 @@ mod tests {
 
         assert_eq!(buffer.len(), 3);
         assert_eq!(buffer[2].1, "<@UBOTID> what about this?");
+    }
+
+    // ── DM detection and prefix tests ───────────────────────────
+
+    #[test]
+    fn dm_detected_when_channel_type_is_im() {
+        let event = serde_json::json!({
+            "type": "message",
+            "channel": "D12345",
+            "channel_type": "im",
+            "user": "U111",
+            "text": "hello",
+            "ts": "123.001"
+        });
+        let is_dm = event.get("channel_type").and_then(|t| t.as_str()) == Some("im");
+        assert!(is_dm);
+    }
+
+    #[test]
+    fn dm_not_detected_for_channel_messages() {
+        let event = serde_json::json!({
+            "type": "message",
+            "channel": "C12345",
+            "channel_type": "channel",
+            "user": "U111",
+            "text": "hello",
+            "ts": "123.001"
+        });
+        let is_dm = event.get("channel_type").and_then(|t| t.as_str()) == Some("im");
+        assert!(!is_dm);
+    }
+
+    #[test]
+    fn dm_not_detected_when_channel_type_missing() {
+        let event = serde_json::json!({
+            "type": "message",
+            "channel": "C12345",
+            "user": "U111",
+            "text": "hello",
+            "ts": "123.001"
+        });
+        let is_dm = event.get("channel_type").and_then(|t| t.as_str()) == Some("im");
+        assert!(!is_dm);
+    }
+
+    #[test]
+    fn dm_bypasses_mention_check() {
+        // In a DM, mentioned is true even without @-mention in text
+        let is_dm = true;
+        let text = "hello without any mention";
+        let bot_user_id = "U99999";
+        let mentioned = is_dm || SlackChannel::contains_bot_mention(text, bot_user_id);
+        assert!(mentioned);
+    }
+
+    #[test]
+    fn non_dm_still_requires_mention() {
+        let is_dm = false;
+        let text = "hello without any mention";
+        let bot_user_id = "U99999";
+        let mentioned = is_dm || SlackChannel::contains_bot_mention(text, bot_user_id);
+        assert!(!mentioned);
+    }
+
+    #[test]
+    fn dm_prefix_format() {
+        let sender_name = "zeroclaw_user";
+        let content = "what is the weather?";
+        let is_dm = true;
+        let result = if is_dm {
+            format!("[Direct message from {sender_name}]\n{content}")
+        } else {
+            content.to_string()
+        };
+        assert_eq!(
+            result,
+            "[Direct message from zeroclaw_user]\nwhat is the weather?"
+        );
+    }
+
+    #[test]
+    fn non_dm_has_no_prefix() {
+        let content = "what is the weather?";
+        let is_dm = false;
+        let result = if is_dm {
+            format!("[Direct message from someone]\n{content}")
+        } else {
+            content.to_string()
+        };
+        assert_eq!(result, "what is the weather?");
     }
 }
